@@ -1,0 +1,27 @@
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Environments
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+
+# Local configuration
+.env
+.env.*
+!.env.example
+config.local.py
+secrets.json
+
+# Temporary files
+*.log
+*.tmp
+temp/
+tmp/
