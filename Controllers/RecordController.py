@@ -1,146 +1,124 @@
-
-"""Записи: формы, сохранение и вычисляемые идентификаторы изделия."""
+"""Операции с записями: правила изделий, идентификаторы и работа с БД."""
 from datetime import date
-from tkinter import messagebox
+import re
 from Controllers.AlgorithmController import AlgorithmController as Algo
 from Controllers.SQL import SQL
-from Interface.ColumnNames import display_name
-from Interface.InterfaceRecord import AddRecordWindow, EditRecordWindow
 
-#===== Настройки формы изделия =====
 TYPE_FIELDS = ('Product_name', 'UYAIS', 'FNN')
 DEFAULTS = {'Cargo_place_count': 1, 'Cargo_place_number': 1, 'Items_per_package': 1}
-ORGANIZATION_NAME = ''  
+HIDDEN = {'id', 'UII', 'TKN', 'code_id', 'product_type_id', 'cargo_year'}
+RECALC_FIELDS = {'UYAIS', 'Serial_number', 'product_serial_number',
+                 'Issuance_agency_code', 'Organization_code', 'cargo_year'}
+ORGANIZATION_NAME = 'АО Аэроэлектромаш'
 
 
 class RecordController:
-    def __init__(self, bd, parent, on_change):
-        self.bd, self.parent, self.on_change = bd, parent, on_change
+    #===== Подключение источника данных =====
+    def __init__(self, bd):
+        self.bd = bd
 
-    #===== Чтение и примечания; вызываются из MainController =====
+    #===== Получение записи =====
     def get_record(self, table, record_id):
         return SQL.get_record(self.bd, table, record_id)
 
+    #===== Подготовка полей, типов и значений для формы =====
+    def form_data(self, table, columns):
+        product = table == 'Product'
+        excluded = HIDDEN | ({'product_serial_number'} if product else set())
+        required = set(SQL.get_required_columns(self.bd, table)) - {'FNN', 'Serial_number'}
+        fields = [(name, name in required or product and name in TYPE_FIELDS[:2])
+                  for name in columns if name not in excluded and not name.endswith('_id')]
+        types = SQL.get_product_types(self.bd) if product else []
+        defaults = {k: v for k, v in DEFAULTS.items() if k in columns} if product else {}
+        if product and ORGANIZATION_NAME:
+            codes = SQL.get_record(self.bd, 'Recipient', ORGANIZATION_NAME,
+                                   ('Code_organization', 'Issuing_agency_code'),
+                                   key='Name_of_organization')
+            if not codes or any(v is None for v in codes.values()):
+                raise ValueError('Организация не найдена или её коды не заполнены')
+            defaults.update(Organization_code=codes['Code_organization'],
+                            Issuance_agency_code=codes['Issuing_agency_code'])
+        return fields, types, defaults
+
+    #===== Проверка точной длины числовых идентификаторов =====
+    @staticmethod
+    def validate_numbers(values):
+        lengths = {'Serial_number': 6, 'FNN': 13, 'product_serial_number': 5}
+        for key, length in lengths.items():
+            if key not in values:
+                continue
+            value = values[key]
+            if value is None or value == '':
+                if key in ('FNN', 'Serial_number'):
+                    values[key] = None
+                    continue
+                if key == 'product_serial_number':
+                    raise ValueError('Номер груза должен содержать ровно 5 цифр')
+                raise ValueError('Серийный номер должен содержать ровно 6 цифр')
+            if not re.fullmatch(r'[0-9]{%d}' % length, str(value)):
+                title = {'Serial_number': 'Серийный номер', 'FNN': 'ФНН',
+                         'product_serial_number': 'Номер груза'}[key]
+                raise ValueError('{} должен содержать ровно {} цифр'.format(title, length))
+
+    #===== Расчёт названий документов по УЯИС =====
+    @staticmethod
+    def document_names(uyais):
+        return Algo.generate_docs(uyais)
+
+    #===== Добавление записи в выбранную таблицу =====
+    def add_record(self, table, values, selected_type=None):
+        if table == 'Product':
+            return self.add_product(values, selected_type)
+        if table == 'ProductType':
+            values = dict(values)
+            self.validate_numbers(values)
+        return SQL.add_record(self.bd, table, values, commit=False)
+
+    #===== Изменение записи в выбранной таблице =====
+    def update_record(self, table, record_id, values):
+        if table == 'Product':
+            return self.update_product(record_id, values)
+        if table == 'ProductType':
+            values = dict(values)
+            self.validate_numbers(values)
+        SQL.update_record(self.bd, table, record_id, values, commit=False)
+
+    #===== Удаление записи в выбранной таблице =====
+    def delete_record(self, table, record_id):
+        if table == 'Product':
+            return self.delete_product(record_id)
+        SQL.delete_record(self.bd, table, record_id, commit=False)
+
+    #===== Сохранение примечаний отдельно от идентификаторов =====
     def save_notes(self, record_id, text):
-        SQL.update_record(self.bd, 'Product', record_id, {'Notes': text or None})
+        SQL.update_record(self.bd, 'Product', record_id, {'Notes': text or None}, commit=False)
 
-    #===== Общая обработка форм; используется при сохранении любой таблицы =====
-    @staticmethod
-    def form_values(window, columns, adding=False):
-        names = {display_name(column): column for column in columns}
-        return {names[label]: value for label, value in window.get_values().items()
-                if label in names and (value or not adding)}
-
-    def finish_form(self, window):
-        self.bd.connection.commit()
-        window.destroy()
-        self.on_change()
-
-    #===== Открытие формы добавления; кнопка передаёт данные в save_record =====
-    def open_add_record(self, table, columns):
-        try:
-            product = table == 'Product'
-            excluded = {'id', 'product_type_id', 'product_serial_number'} if product else {'id'}
-            required = set(SQL.get_required_columns(self.bd, table))
-            fields = [(display_name(c), 'Введите ' + display_name(c),
-                       c in required or product and c in TYPE_FIELDS)
-                      for c in columns if c not in excluded]
-            types = ({f'{name} (ID: {ident})': (ident, name, uyais, fnn)
-                      for ident, name, uyais, fnn in SQL.get_product_types(self.bd)} if product else {})
-            defaults = dict(DEFAULTS) if product else {}
-            if product and ORGANIZATION_NAME:
-                codes = SQL.get_record(self.bd, 'Recipient', ORGANIZATION_NAME,
-                                       ('Code_organization', 'Issuing_agency_code'),
-                                       key='Name_of_organization')
-                if not codes or any(value is None for value in codes.values()):
-                    raise ValueError('Организация не найдена или её коды не заполнены')
-                defaults.update(Organization_code=codes['Code_organization'],
-                                Issuance_agency_code=codes['Issuing_agency_code'])
-            window = AddRecordWindow(self.parent, table, fields,
-                                     lambda: self.save_record(window, table, columns, types),
-                                     type_names=list(types) if product else None,
-                                     on_type_select=lambda name: self.fill_type(window, types.get(name)))
-            if product:
-                window.set_fields({display_name(c): value for c, value in defaults.items() if c in columns})
-                entry = window.entries.get(display_name('UYAIS'))
-                if entry:
-                    entry.bind('<KeyRelease>', lambda _: self.fill_docs(window))
-        except Exception as error:
-            self.bd.connection.rollback()
-            messagebox.showerror('Ошибка', f'Не удалось открыть добавление записи:\n{error}')
-
-    #===== Автозаполнение; вызывается при выборе ProductType и изменении УЯИС =====
-    def fill_type(self, window, data=None):
-        window.set_fields({display_name(key): value for key, value in
-                           zip(TYPE_FIELDS, data[1:] if data else ('', '', ''))},
-                          disabled=data is not None)
-        self.fill_docs(window)
-
-    @staticmethod
-    def fill_docs(window):
-        entry = window.entries.get(display_name('UYAIS'))
-        if entry:
-            window.set_fields({display_name(key): value or ''
-                               for key, value in Algo.generate_docs(entry.get()).items()})
-
-    #===== Редактирование: вызывается двойным кликом по строке =====
-    def open_edit_record(self, table, columns, record):
-        row = dict(zip(columns, record))
-        values = {'id': row['id'], **{display_name(key): value for key, value in row.items()
-                                    if key != 'id'}}
-        window = EditRecordWindow(self.parent, table, values,
-                                  lambda: self.save_record(window, table, columns),
-                                  lambda: self.save_record(window, table, columns, delete=True))
-
-    #===== Единый обработчик добавления, редактирования и удаления записей =====
-    def save_record(self, window, table, columns, types=None, delete=False):
-        adding = types is not None
-        try:
-            if delete:
-                if table == 'Product':
-                    self.delete_product(window.record_id)
-                else:
-                    SQL.delete_record(self.bd, table, window.record_id, commit=False)
-            else:
-                values = self.form_values(window, columns, adding)
-                if adding:
-                    if table == 'Product':
-                        self.add_product(values, types.get(window.type_menu.get()))
-                    else:
-                        SQL.add_record(self.bd, table, values, commit=False)
-                else:
-                    values = {key: value or None for key, value in values.items()}
-                    if table == 'Product':
-                        self.update_product(window.record_id, values)
-                    else:
-                        SQL.update_record(self.bd, table, window.record_id, values, commit=False)
-            self.finish_form(window)
-        except Exception as error:
-            self.bd.connection.rollback()
-            action = 'удалить' if delete else 'добавить' if adding else 'обновить'
-            messagebox.showerror('Ошибка', f'Не удалось {action} запись:\n{error}')
-
-    #===== УИИ, ТКН и документы; вызывается после создания и изменения изделия =====
-    def recalculate_product(self, record_id, year=None):
+    #===== Расчёт идентификаторов и документов изделия =====
+    def recalculate_product(self, record_id, year=None, product=None):
         columns = ('UYAIS', 'Serial_number', 'product_serial_number',
-                   'Issuance_agency_code', 'Organization_code', 'TKN')
-        row = SQL.get_record(self.bd, 'Product', record_id, columns)
+                   'Issuance_agency_code', 'Organization_code', 'TKN', 'cargo_year')
+        row = product if product is not None else SQL.get_record(self.bd, 'Product', record_id)
         if row is None:
             raise ValueError('Изделие не найдено')
-        uyais, serial, number, agency, org, old_tkn = (row[key] for key in columns)
-        values = Algo.generate_docs(uyais)
+        uyais, serial, number, agency, org, old_tkn, cargo_year = (row.get(c) for c in columns)
+        result = Algo.generate_docs(uyais)
         if agency and org:
             chars, ids = Algo.translation_maps(SQL.get_translations(self.bd))
-            digit = str(year)[-1] if year else (old_tkn[-7] if old_tkn and len(old_tkn) >= 7
-                                               else str(date.today().year)[-1])
-            values['UII'] = Algo.generate_uii(uyais, serial, agency, org, chars) if uyais and serial else None
-            values['TKN'] = Algo.generate_tkn(number, agency, org, ids, digit) if number else None
+            digit = str(cargo_year or year)[-1] if cargo_year or year else None
+            if number and digit is None:
+                raise ValueError('У изделия не указан год присвоения номера груза')
+            result['UII'] = Algo.generate_uii(uyais, serial, agency, org, chars) if uyais and serial else None
+            result['TKN'] = Algo.generate_tkn(number, agency, org, ids, digit) if number else None
         else:
-            values.update(UII=None, TKN=None)
-        SQL.update_record(self.bd, 'Product', record_id, values, commit=False)
+            result.update(UII=None, TKN=None)
+        SQL.update_record(self.bd, 'Product', record_id, result, commit=False)
 
-    #===== Product и ProductType; используются единым обработчиком save_record =====
+    #===== Создание изделия без автоматического номера груза =====
     def add_product(self, values, selected_type=None):
+        values = dict(values)
+        values.pop('UII', None)
+        values.pop('TKN', None)
+        values.pop('cargo_year', None)
         if selected_type is not None:
             type_id = selected_type[0]
             data = SQL.get_record(self.bd, 'ProductType', type_id, TYPE_FIELDS)
@@ -149,41 +127,81 @@ class RecordController:
             values.update(data)
         else:
             data = [values.get(name) for name in TYPE_FIELDS]
-            if not all(data):
-                raise ValueError('Укажите наименование, УЯИС и ФНН')
-            type_id = SQL.get_or_create_product_type(self.bd, data)
-        year = date.today().year
-        number = SQL.next_serial(self.bd, year)
-        if number > 99999:
-            raise ValueError('На этот год закончились пятизначные номера')
-        values.update(product_type_id=type_id, product_serial_number=f'{number:05d}')
-        for name in ('UII', 'TKN'):
-            values.pop(name, None)
-        ident = SQL.add_record(self.bd, 'Product', values, commit=False)
-        self.recalculate_product(ident, year)
+            if not all(data[:2]):
+                raise ValueError('Укажите наименование и УЯИС')
+            values['FNN'] = values.get('FNN') or None
+        values['Serial_number'] = values.get('Serial_number') or None
+        self.validate_numbers(values)
+        if selected_type is None:
+            type_id = SQL.get_or_create_product_type(self.bd,
+                [values.get(name) for name in TYPE_FIELDS])
+        # Номер груза и год присваиваются только отдельной командой.
+        values.pop('product_serial_number', None)
+        ident = SQL.add_record(self.bd, 'Product',
+                               {**values, 'product_type_id': type_id,
+                                'product_serial_number': None, 'cargo_year': None}, commit=False)
+        self.recalculate_product(ident)
         return ident
 
+    #===== Однократное присвоение номера груза выбранному изделию =====
+    def assign_cargo_number(self, record_id):
+        # Блокировка строки защищает от повторного присвоения в другом сеансе.
+        query = 'SELECT id FROM public."Product" WHERE id=%s FOR UPDATE'
+        if not SQL._query(self.bd, query, (record_id,)).fetchone():
+            raise ValueError('Изделие не найдено')
+        product = SQL.get_record(self.bd, 'Product', record_id)
+        if product.get('product_serial_number') is not None:
+            raise ValueError('Номер груза уже присвоен этому изделию')
+        year = date.today().year
+        agency, org = product.get('Issuance_agency_code'), product.get('Organization_code')
+        if not agency or not org:
+            raise ValueError('Для присвоения номера заполните коды организации и органа выдачи')
+        _, identifiers = Algo.translation_maps(SQL.get_translations(self.bd))
+        number = 0
+        while True:
+            number = SQL.next_serial(self.bd, year, after=number)
+            if number is None:
+                raise ValueError('В {} году не осталось свободных номеров груза'.format(year))
+            tkn = Algo.generate_tkn(number, agency, org, identifiers, str(year)[-1])
+            if not SQL.tkn_exists(self.bd, product['UYAIS'], tkn):
+                break
+        SQL.update_record(self.bd, 'Product', record_id,
+                          {'product_serial_number': '{:05d}'.format(number),
+                           'cargo_year': year}, commit=False)
+        self.recalculate_product(record_id)
+        return '{:05d}'.format(number)
+
+    #===== Обновление только изменённых полей и зависимых идентификаторов =====
     def update_product(self, record_id, values):
-        old = SQL.get_record(self.bd, 'Product', record_id)
+        old = self.get_record('Product', record_id)
         if old is None:
             raise ValueError('Изделие не найдено')
-        for name in ('UII', 'TKN'):
-            values.pop(name, None)
-        if any(key in values and values[key] != old.get(key) for key in TYPE_FIELDS):
-            fields = [values.get(key, old.get(key)) for key in TYPE_FIELDS]
-            if not all(fields):
-                raise ValueError('Укажите наименование, УЯИС и ФНН')
-            values['product_type_id'] = SQL.get_or_create_product_type(self.bd, fields)
-        SQL.update_record(self.bd, 'Product', record_id, values, commit=False)
-        self.recalculate_product(record_id)
+        changes = {k: v for k, v in values.items() if k not in ('UII', 'TKN', 'cargo_year')
+                   and str(v if v is not None else '') != str(old.get(k) if old.get(k) is not None else '')}
+        if not changes:
+            return
+        if 'product_serial_number' in changes:
+            number = changes['product_serial_number']
+            if number in (None, ''):
+                changes.update(product_serial_number=None, cargo_year=None)
+            else:
+                changes['cargo_year'] = old.get('cargo_year') or date.today().year
+        self.validate_numbers(changes)
+        if any(k in changes for k in TYPE_FIELDS):
+            fields = [changes.get(k, old.get(k)) for k in TYPE_FIELDS]
+            if not all(fields[:2]):
+                raise ValueError('Укажите наименование и УЯИС')
+            changes['product_type_id'] = SQL.get_or_create_product_type(self.bd, fields)
+        SQL.update_record(self.bd, 'Product', record_id, changes, commit=False)
+        if RECALC_FIELDS.intersection(changes):
+            self.recalculate_product(record_id, product={**old, **changes})
         old_type = old.get('product_type_id')
-        if old_type and old_type != values.get('product_type_id', old_type):
+        if old_type and old_type != changes.get('product_type_id', old_type):
             SQL.delete_unused_type(self.bd, old_type)
 
-    def delete_product(self, record_id, commit=False):
+    #===== Удаление изделия и неиспользуемого вида =====
+    def delete_product(self, record_id):
         row = SQL.get_record(self.bd, 'Product', record_id, 'product_type_id')
         SQL.delete_record(self.bd, 'Product', record_id, commit=False)
         if row and row['product_type_id'] is not None:
             SQL.delete_unused_type(self.bd, row['product_type_id'])
-        if commit:
-            self.bd.connection.commit()

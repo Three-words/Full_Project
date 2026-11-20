@@ -7,6 +7,7 @@ from PIL import Image
 
 
 class ControlPanelUser:
+    ADMIN_BUTTONS = ()
     SECTIONS = (
         ('ИЗДЕЛИЯ', (('products', 'Изделия'), ('categories', 'Категории'),
                      ('warehouse', 'Склады'))),
@@ -22,6 +23,7 @@ class ControlPanelUser:
         self.products_count = ctk.IntVar(value=0)
         self.scanner_status_label = None
         names = [name for _, section in self.SECTIONS for name, _ in section]
+        names.extend(name for name, _ in self.ADMIN_BUTTONS)
         self.icons = self.load_icons(names)
 
     @staticmethod
@@ -54,7 +56,6 @@ class ControlPanelUser:
             self.scanner_status_label.pack(side='right', padx=4)
 
     def draw_sections(self, parent):
-        self.header(parent, 'Панель управления', 18)
         for title, buttons in self.SECTIONS:
             self.header(parent, title)
             for name, label in buttons:
@@ -66,6 +67,7 @@ class ControlPanelUser:
         self.status_label.pack(side='bottom', fill='x', padx=14, pady=(10, 18))
 
     def draw(self):
+        self.header(self.parent, 'Панель управления', 18)
         self.draw_sections(self.parent)
         self.draw_status(self.parent)
 
@@ -158,10 +160,6 @@ class AdminControlPanel(ControlPanelUser):
                      ('add_column', 'Добавить столбец'),
                      ('delete_column', 'Удалить столбец'))
 
-    def __init__(self, parent, status_var):
-        super().__init__(parent, status_var)
-        self.icons.update(self.load_icons(name for name, _ in self.ADMIN_BUTTONS))
-
     def draw(self):
         footer = ctk.CTkFrame(self.parent, fg_color='#202938', corner_radius=0)
         footer.pack(side='bottom', fill='x')
@@ -174,10 +172,7 @@ class AdminControlPanel(ControlPanelUser):
         self.table_menu.pack(fill='x', padx=14, pady=5)
         for name, title in self.ADMIN_BUTTONS:
             self.draw_button(scroll, name, title, 'normal' if name == 'add_table' else 'disabled')
-        for title, buttons in self.SECTIONS:
-            self.header(scroll, title)
-            for name, label in buttons:
-                self.draw_button(scroll, name, label)
+        self.draw_sections(scroll)
         root = self.parent.winfo_toplevel()
         root.bind('<ButtonPress-1>', self.close_on_outside, add='+')
         root.bind('<Escape>', lambda _: self.close_popup(), add='+')

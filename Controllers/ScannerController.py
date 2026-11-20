@@ -1,4 +1,3 @@
-
 """COM-сканер: подключение, чтение, проверка сохранённых кодов."""
 import sys
 from pathlib import Path
@@ -19,14 +18,16 @@ if sys.platform == 'win32':
 
 
 class ScannerController:
+    #===== Инициализация COM-порта и звуков =====
     def __init__(self, view, on_code, on_status_change):
         self.view, self.on_code, self.on_status_change = view, on_code, on_status_change
         self.ser = self.poll_job = None
         self.buffer, self.last_read, self.codes = b'', 0, {}
+        self.verifying = False
         self.mci = windll.winmm.mciSendStringW if sys.platform == 'win32' else None
         self.sounds = {}
         if self.mci:
-            folder = Path(__file__).resolve().parent.parent / 'Sounds'
+            folder = Path(__file__).resolve().parent.parent / 'sounds'
             for state, filename in SOUND_FILES.items():
                 path, alias = folder / filename, 'code_studio_' + state
                 if path.is_file() and not self.mci(
@@ -35,15 +36,12 @@ class ScannerController:
         view.test_button.configure(command=self.test_scanner)
         view.disconnect_button.configure(command=self.disconnect, state='disabled')
 
-    #===== Состояние сканера; MainController не обращается к порту напрямую =====
+    #===== Проверка состояния подключения =====
     @property
     def is_connected(self):
         return bool(self.ser and self.ser.is_open)
 
-    def clear_codes(self):
-        self.codes.clear()
-
-    #===== Подключение; вызывается кнопкой «Тест сканера» =====
+    #===== Определение COM-порта сканера =====
     @staticmethod
     def find_port(ports):
         for port in ports:
@@ -53,6 +51,7 @@ class ScannerController:
                 return port
         return ports[0] if len(ports) == 1 else None
 
+    #===== Подключение и проверка сканера =====
     def test_scanner(self):
         self.disconnect()
         ports = list(list_ports.comports())
@@ -69,7 +68,7 @@ class ScannerController:
             self.disconnect()
             messagebox.showerror('Ошибка подключения', str(error))
 
-    #===== Считывание COM-порта; повторный вызов ставится через after =====
+    #===== Чтение данных с COM-порта =====
     def read_port(self):
         self.poll_job = None
         if not self.is_connected:
@@ -88,12 +87,13 @@ class ScannerController:
             return messagebox.showerror('Ошибка сканера', str(error))
         self.poll_job = self.view.parent.after(POLL_INTERVAL, self.read_port)
 
-    #===== Отключение и обновление состояния; вызывается из MainController =====
+    #===== Обновление интерфейса при подключении и отключении =====
     def set_status(self, connected, model='—', port='—'):
         self.view.set_info(connected, model, port)
         self.on_status_change(connected)
         self.view.disconnect_button.configure(state='normal' if connected else 'disabled')
 
+    #===== Отключение сканера =====
     def disconnect(self):
         if self.poll_job is not None:
             self.view.parent.after_cancel(self.poll_job)
@@ -101,9 +101,11 @@ class ScannerController:
         if self.is_connected:
             self.ser.close()
         self.ser, self.buffer = None, b''
+        self.verifying = False
+        self.codes.clear()
         self.set_status(False)
 
-    #===== Проверка кодов; вызывается из MainController.toggle_verify/on_scanned =====
+    #===== Загрузка кодов изделия для проверки =====
     def load_codes(self, bd, product_id):
         product = SQL.get_record(bd, 'Product', product_id, 'code_id')
         if not product or product['code_id'] is None:
@@ -115,12 +117,44 @@ class ScannerController:
         if not self.codes:
             raise ValueError('Данные кодов не сохранены. Сгенерируйте этикетки.')
 
-    def check(self, scanned):
-        return self.codes.get(scanned.encode('utf-8').rstrip(b'\r\n'))
+    #===== Включение и выключение проверки кодов =====
+    def toggle_verify(self, bd, product_id):
+        if self.verifying:
+            self.verifying = False
+            self.codes.clear()
+            return False
+        if product_id is None:
+            messagebox.showwarning('Проверка', 'Выберите изделие')
+            return None
+        if not self.is_connected:
+            messagebox.showwarning('Проверка', 'Подключите сканер')
+            return None
+        self.load_codes(bd, product_id)
+        self.verifying = True
+        return True
 
+    #===== Проверка кода и воспроизведение звукового сигнала =====
+    def verify(self, scanned):
+        label = self.codes.get(scanned.encode('utf-8').rstrip(b'\r\n'))
+        state = 'success' if label else 'mismatch'
+        self.play_sound(state)
+        return state, label[4:] if label else ''
+
+    #===== Воспроизведение звука результата проверки =====
     def play_sound(self, state):
         alias = self.sounds.get(state)
         if alias:
             for sound in self.sounds.values():
                 self.mci('stop ' + sound, None, 0, None)
             self.mci(f'play {alias} from 0', None, 0, None)
+            
+    #===== Завершение работы COM-порта и освобождение звуков Windows =====
+    def shutdown(self):
+        try:
+            self.disconnect()
+        finally:
+            if self.mci:
+                for alias in self.sounds.values():
+                    self.mci('stop ' + alias, None, 0, None)
+                    self.mci('close ' + alias, None, 0, None)
+                self.sounds.clear()

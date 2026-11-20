@@ -125,7 +125,13 @@ class App(ctk.CTk):
         self.connection_status.set('•  ' + text)
         self.control_panel.status_label.configure(text_color=color)
 
+    #===== Корректное завершение сканера, БД и главного цикла =====
     def close(self):
-        self.controller.scanner.disconnect()
-        self.bd.Disconnect_BD()
-        self.destroy()
+        try:
+            self.controller.scanner.shutdown()
+        finally:
+            try:
+                self.bd.Disconnect_BD()
+            finally:
+                self.quit()
+                self.destroy()

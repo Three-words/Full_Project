@@ -1,13 +1,16 @@
 
-"""Управление просмотром готовых SVG и каталога шаблонов."""
+"""Просмотр SVG-этикеток и демонстрационных шаблонов через CairoSVG."""
+import os
+import sys
+from functools import lru_cache
+from io import BytesIO
 from pathlib import Path
 from queue import Empty, Queue
 from threading import Thread
 from tkinter import filedialog, messagebox
 from xml.etree import ElementTree as ET
-from GenerateQR import SVGController as svg
-from GenerateQR.TemplateController import TemplateController
-from Interface.SVGViewer import SVGViewer, TemplatesWindow
+
+from Interface.SVGViewer import SVGViewer
 
 TEMPLATES = (
     ('Общая маркировка УИИ / ФНН', 'SVG_Uniq_Marker'),
@@ -18,79 +21,93 @@ TEMPLATES = (
     ('Паспорт изделия', 'SVG_Passport'),
     ('Транспортная этикетка', 'transport'))
 
-#===== Демоданные: только подстановка значений, не разметка этикеток =====
-SAMPLE = dict(UII='1234567890', FNN='12345678', Serial_number='123456789',
-              UYAIS='123456', Issuance_agency_code='45', Organization_code='123',
-              Cargo_place_count='2', Items_per_package=1, RE_Translit='RE-1234',
-              RO_Translit='RO-1234', Passport_Translit='PASS-1234')
-TRANSPORT = dict(tkn='1234567890', fnn='12345678', sender='123', recipient='456',
-                 recipient_address='MOSCOW', place_number=1, place_count=2,
-                 items_per_package=1, gross='12,5', net='11', dimensions='40x30x20')
+#===== Подключение локальных DLL Cairo =====
+if os.name == 'nt':
+    root = Path(getattr(sys, '_MEIPASS', Path(__file__).resolve().parents[1]))
+    folder = root / 'cairo'
+    if not (folder / 'libcairo-2.dll').is_file():
+        raise FileNotFoundError('Не найдена библиотека Cairo: ' + str(folder))
+    os.environ['CAIROCFFI_DLL_DIRECTORIES'] = str(folder)
+    os.environ['PATH'] = str(folder) + os.pathsep + os.environ.get('PATH', '')
+    _dll_handle = os.add_dll_directory(str(folder))
+
+
+#===== Преобразование SVG в изображение с кэшированием =====
+@lru_cache(maxsize=8)
+def preview(source):
+    from PIL import Image
+    import cairosvg
+
+    _, _, w, h = map(float, ET.fromstring(source).get('viewBox').split())
+    scale = min(12, 500 / max(w, h))
+    png = cairosvg.svg2png(bytestring=source.encode('utf-8'),
+                           output_width=max(1, round(w * scale)),
+                           output_height=max(1, round(h * scale)),
+                           background_color='white')
+    with Image.open(BytesIO(png)) as image:
+        return image.convert('RGB')
 
 
 class PreviewController:
-    #===== Общие состояния двух просмотрщиков =====
-    def __init__(self, parent):
-        self.parent, self.view = parent, None
-        self.image, self.zoom, self.fit = None, 1, False
+    #===== Подготовка окна просмотра или каталога =====
+    def __init__(self, parent, make_label=None, custom_names=None, make_custom=None):
+        self.parent, self.make_label = parent, make_label
+        self.custom_names, self.make_custom = custom_names, make_custom
+        self.catalog = list(TEMPLATES)
+        self.view, self.image, self.zoom, self.fit = None, None, 1, False
         self.results, self.pending, self.request = Queue(), 0, 0
+        self.sources = {}
 
-    #===== Подключение масштаба и изменения размера =====
+    #===== Привязка событий просмотра =====
     def attach(self, view):
         self.view = view
         view.canvas.bind('<Configure>', lambda _: self.redraw())
         view.canvas.bind('<MouseWheel>', self.wheel)
 
-    #===== Показ окна поверх главного без изменения topmost =====
-    def present(self):
-        self.view.deiconify()
-        self.view.lift(self.parent.winfo_toplevel())
-        self.view.focus_set()
-
-    #===== Увеличение и уменьшение колесом мыши =====
+    #===== Масштабирование колесом мыши =====
     def wheel(self, event):
         if self.image is not None:
             self.fit = False
-            self.zoom = max(0.05, min(4000 / max(self.image.size),
-                                      self.zoom * (1.15 if event.delta > 0 else 1 / 1.15)))
+            factor = 1.15 if event.delta > 0 else 1 / 1.15
+            self.zoom = max(0.05, min(4000 / max(self.image.size), self.zoom * factor))
             self.redraw()
         return 'break'
 
-    #===== Перерисовка при изменении окна =====
+    #===== Отображение изображения на холсте =====
     def redraw(self):
-        if self.image is None or not self.view or not self.view.winfo_exists():
+        if self.image is None or self.view is None or not self.view.winfo_exists():
             return
-        canvas = self.view.canvas
         if self.fit:
-            self.zoom = min(1, (canvas.winfo_width() - 40) / self.image.width,
-                            (canvas.winfo_height() - 40) / self.image.height)
+            canvas = self.view.canvas
+            self.zoom = max(0.05, min(1, (canvas.winfo_width() - 40) / self.image.width,
+                                      (canvas.winfo_height() - 40) / self.image.height))
         self.view.display(self.image, self.zoom)
 
-    #===== Общая загрузка без блокировки Tkinter =====
+    #===== Запуск фонового преобразования SVG =====
     def load(self, source):
         self.request += 1
         token = self.request
-        self.image = None
-        self.view.clear('Загрузка этикетки…')
+        self.pending += 1
 
+        #===== Передача результата в очередь =====
         def work():
             try:
-                self.results.put((token, source, svg.preview(source), None))
-            except Exception as error:
-                self.results.put((token, source, None, error))
+                image, error = preview(source), None
+            except Exception as exc:
+                image, error = None, exc
+            self.results.put((token, image, error))
 
         Thread(target=work, daemon=True).start()
-        self.pending += 1
         if self.pending == 1:
-            self.parent.after(80, self.poll)
+            self.parent.after(40, self.poll)
 
-    #===== Приём изображений в основном потоке =====
+    #===== Получение результата в основном потоке Tkinter =====
     def poll(self):
         try:
             while True:
-                token, source, image, error = self.results.get_nowait()
+                token, image, error = self.results.get_nowait()
                 self.pending -= 1
-                if token != self.request or not self.view.winfo_exists():
+                if token != self.request or not self.view or not self.view.winfo_exists():
                     continue
                 if error:
                     self.view.clear('Ошибка предпросмотра')
@@ -102,69 +119,63 @@ class PreviewController:
         except Empty:
             pass
         if self.pending:
-            self.parent.after(80, self.poll)
+            self.parent.after(40, self.poll)
 
-
-class SVGPreviewController(PreviewController):
-    #===== Открытие существующей SVG-этикетки =====
-    def open(self, source, name, product_id, title):
+    #===== Открытие сохранённой этикетки =====
+    def open(self, source, name, product_id, title, owner=None):
         if self.view is None or not self.view.winfo_exists():
-            self.attach(SVGViewer(self.parent, self.save))
+            self.attach(SVGViewer(self.parent, on_save=self.save))
         self.source, self.filename = source, f'{name[4:]}_{product_id}.svg'
         self.view.heading.configure(text=title)
         self.load(source)
-        self.present()
+        self.view.transient(owner if owner and owner.winfo_exists() else self.parent.winfo_toplevel())
+        self.view.deiconify()
+        self.view.lift(owner if owner and owner.winfo_exists() else self.parent.winfo_toplevel())
+        self.view.focus_force()
 
-    #===== Экспорт исходного SVG =====
+    #===== Сохранение исходного SVG =====
     def save(self):
-        path = filedialog.asksaveasfilename(parent=self.view, initialfile=self.filename,
-                                           defaultextension='.svg', filetypes=[('SVG', '*.svg')])
+        path = filedialog.asksaveasfilename(
+            parent=self.view, initialfile=self.filename,
+            defaultextension='.svg', filetypes=[('SVG', '*.svg')])
         if path:
             try:
                 Path(path).write_text(self.source, encoding='utf-8')
             except OSError as error:
                 messagebox.showerror('Ошибка сохранения', str(error), parent=self.view)
 
-
-class TemplatesController(PreviewController):
-    #===== Подготовка каталога через существующий генератор =====
-    def __init__(self, parent, renderer):
-        super().__init__(parent)
-        self.renderer, self.sources = renderer, {}
-
-    #===== Открытие каталога =====
-    def open(self):
+    #===== Открытие каталога стандартных и пользовательских шаблонов =====
+    def open_catalog(self):
+        if self.make_label is None:
+            raise RuntimeError('Для каталога не задан генератор примеров')
+        names = list(self.custom_names()) if self.custom_names else []
+        self.catalog = list(TEMPLATES) + [('Пользовательский: ' + name, name) for name in names]
+        titles = [title for title, _ in self.catalog]
         if self.view is None or not self.view.winfo_exists():
-            self.attach(TemplatesWindow(self.parent, [title for title, _ in TEMPLATES], self.select))
-            self.view.after_idle(lambda: self.select(0))
-        self.present()
+            self.attach(SVGViewer(self.parent, titles=titles, on_select=self.select_template))
+        else:
+            self.view.set_titles(titles)
+        self.sources.clear()
+        self.view.deiconify()
+        self.view.lift()
+        self.view.focus_set()
+        self.select_template(0)
 
-    #===== Получение этикетки без собственной разметки =====
-    def get_source(self, key):
-        if key not in self.sources:
-            if key == 'transport':
-                fields = TemplateController.transport_fields(TRANSPORT)
-                self.sources[key] = self.renderer.render_transport(TRANSPORT, fields)
-            elif key == 'package_many':
-                self.sources[key], _ = self.renderer.render_package(
-                    {**SAMPLE, 'Items_per_package': 5}, self.parent)
-            else:
-                if 'product' not in self.sources:
-                    labels, _, errors = self.renderer.render_product(SAMPLE, self.parent)
-                    self.sources.update(labels)
-                    self.sources['product'] = errors
-                if key not in self.sources:
-                    raise ValueError('; '.join(self.sources['product']) or 'Шаблон недоступен')
-        return self.sources[key]
-
-    #===== Выбор макета и размера =====
-    def select(self, index):
-        title, key = TEMPLATES[index]
+    #===== Показ шаблона на демонстрационных данных =====
+    def select_template(self, index):
+        title, key = self.catalog[index]
         try:
-            source = self.get_source(key)
+            if index >= len(TEMPLATES):
+                if self.make_custom is None:
+                    raise ValueError('Просмотр пользовательских шаблонов недоступен')
+                source, _ = self.make_custom(key)
+            else:
+                if key not in self.sources:
+                    self.sources[key] = self.make_label(key, self.parent)
+                source = self.sources[key]
             _, _, w, h = map(float, ET.fromstring(source).get('viewBox').split())
-            info = f'Размер: {w:g} × {h:g} мм · Демонстрационные данные'
-            self.view.set_selection(index, title, info)
+            self.view.set_selection(index, title,
+                                    f'Размер: {w:g} × {h:g} мм · Демонстрационные данные')
             self.load(source)
         except Exception as error:
             self.request += 1

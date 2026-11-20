@@ -23,6 +23,7 @@ TRANSPORT_TEXT = (
     ('Блок логистических данных', 52.5, 84.6, svg.FONT_PT, 'middle'))
 
 
+#===== Форматирование числа для подписи =====
 def number(value, trim=False):
     result = str(value).strip().replace('.', ',')
     if trim and ',' in result and set(result.split(',', 1)[1]) == {'0'}:
@@ -30,11 +31,12 @@ def number(value, trim=False):
     return result
 
 
+#===== Форматирование габаритов =====
 def dimensions(values):
     return 'x'.join(number(value, True) for value in values)
 
 
-#===== QR-этикетка с подписями =====
+#===== Создание QR-этикетки с подписями =====
 def qr_label(width, height, code, y, captions, master=None, margin=1.4, left_text=False):
     x = (width - code.full_mm) / 2
     if min(x - margin, y - margin, height - margin - y - code.full_mm) < 0:
@@ -52,64 +54,85 @@ def qr_label(width, height, code, y, captions, master=None, margin=1.4, left_tex
 
 
 class LabelRenderer:
+    #===== Подключение генераторов штрихкодов =====
     def __init__(self, qr, dm, pdf417, code128):
         self.qr, self.dm, self.pdf417, self.code128 = qr, dm, pdf417, code128
 
-    #===== Стандартный комплект =====
-    def render_product(self, product, master=None):
+    #===== Формирование полного комплекта или выбранного макета =====
+    def render_product(self, product, master=None, only=None):
         labels, groups, errors, matrices = {}, {}, [], {}
 
+        #===== Добавление готовой этикетки и её данных =====
         def add(name, drawing, *variants):
             labels[name], groups[name] = drawing, variants
 
         for name, identifier, column, size in MATRIX:
+            if only and only not in (name, 'SVG_Uniq_Marker'):
+                continue
             try:
                 value = product.get(column)
                 if value is None or not str(value).strip():
                     raise ValueError('не заполнено значение')
                 fields = [(identifier, str(value))]
                 matrices[name] = self.dm.create(fields, size)
-                add(name, matrices[name].svg, fields)
             except ValueError as error:
-                errors.append(f'{column}: {error}')
+                if column != 'FNN' or product.get('FNN') not in (None, ''):
+                    errors.append(f'{column}: {error}')
 
-        try:
-            if len(matrices) != 2:
-                raise ValueError('нужны оба кода')
-            add('SVG_Uniq_Marker', self.render_marker(product, matrices, master),
-                [('25S', str(product['UII']))], [('68P', str(product['FNN']))])
-        except ValueError as error:
-            errors.append('Общая этикетка УИИ/ФНН: ' + str(error))
+        if only in (None, 'SVG_Uniq_Marker'):
+            try:
+                if not product.get('FNN') or not str(product['FNN']).strip():
+                    raise ValueError('для генерации необходимо заполнить ФНН')
+                if not product.get('UII') or not str(product['UII']).strip():
+                    raise ValueError('для генерации необходимо заполнить УИИ')
+                if any(name not in matrices for name, _, _, _ in MATRIX):
+                    raise ValueError('не удалось сформировать УИИ или ФНН')
+                variants = [[(identifier, str(product[column]))]
+                            for name, identifier, column, _ in MATRIX if name in matrices]
+                add('SVG_Uniq_Marker', self.render_marker(product, matrices, master), *variants)
+            except ValueError as error:
+                errors.append('Общая этикетка УИИ/ФНН: ' + str(error))
 
-        try:
-            drawing, fields = self.render_package(product, master)
-            add('SVG_Single_Item_Package', drawing, fields)
-        except (ValueError, KeyError, TypeError) as error:
-            errors.append('Упаковка: ' + str(error))
+        if only in (None, 'SVG_Single_Item_Package'):
+            try:
+                drawing, fields = self.render_package(product, master)
+                add('SVG_Single_Item_Package', drawing, fields)
+            except (ValueError, KeyError, TypeError) as error:
+                errors.append('Упаковка: ' + str(error))
 
         for name in DOCUMENTS:
+            if only and only != 'SVG_' + name:
+                continue
             try:
-                values = [product.get('UII'), product.get(name + '_Translit'), product.get('FNN')]
-                if any(value is None or not str(value).strip() for value in values):
-                    raise ValueError('Не заполнены данные документа')
-                values = [str(value).strip() for value in values]
+                required = (('UII', 'УИИ'), (name + '_Translit', 'обозначение документа'),
+                            ('FNN', 'ФНН'))
+                missing = [title for key, title in required
+                           if product.get(key) is None or not str(product[key]).strip()]
+                if missing:
+                    raise ValueError('необходимо заполнить ' + ', '.join(missing))
+                values = [str(product[key]).strip() for key, _ in required]
                 fields = list(zip(DOC_IDS, values))
                 add('SVG_' + name, self.render_document(values, fields, master), fields)
             except (ValueError, KeyError, TypeError) as error:
-                errors.append(name + ': ' + str(error))
+                errors.append({'RE': 'QR РЭ', 'RO': 'QR РО', 'Passport': 'QR Паспорта'}[name] + ': ' + str(error))
         return labels, groups, errors
 
     #===== Общая этикетка УИИ/ФНН =====
     def render_marker(self, product, matrices, master):
         parts = svg.border(49.5, 29)
-        for name, x, expected in (('SVG_UII', 15.2, 20), ('SVG_FNN', 34.8, 18)):
+        captions = []
+        for name, column, x, expected, baseline in (
+                ('SVG_UII', 'UII', 15.2, 20, 22.4),
+                ('SVG_FNN', 'FNN', 34.8, 18, 27.5)):
+            if name not in matrices:
+                continue
             code = matrices[name]
             if code.size != expected:
                 raise ValueError('Матрица не помещается на общую этикетку')
             parts.append(svg.symbol(code, x - code.full_mm / 2, 2.25))
-        for value, x, y in (('УИИ', 15.2, 17.3), ('ФНН', 34.8, 17.3),
-                            ('УИИ: ' + str(product['UII']), 2.5, 22.4),
-                            ('ФНН: ' + str(product['FNN']), 2.5, 27.5)):
+            captions.extend(((column, x, 17.3),
+                             (column + ': ' + str(product[column]), 2.5, baseline)))
+        for value, x, y in captions:
             start = x == 2.5
             width = 49.5 - x - 1 if start else 2 * min(x - 1, 48.5 - x)
             parts.append(svg.text(value, x, y, svg.FONT_PT * svg.PT,
@@ -130,17 +153,18 @@ class LabelRenderer:
         if not uyais:
             raise ValueError('После очистки УЯИС пустой')
         code = str(product['Issuance_agency_code']) + str(product['Organization_code']) + uyais
-        if quantity == 1:
-            fields = [('25P', code), ('Q', str(product['Cargo_place_count'])), ('S', serial)]
-            captions = ((code, 26, svg.FONT_SMALL_PT), ('Сер. №: ' + serial, 31.5, svg.FONT_PT))
-        else:
-            batch = ''.join(re.findall(r'[0-9]', serial))[:3]
-            if len(batch) != 3:
-                raise ValueError('Для 1T нужны три цифры серийного номера')
-            fields = [('25P', code), ('Q', str(quantity)), ('1T', batch)]
-            captions = ((code, 26, svg.FONT_SMALL_PT), ('Пар. №: ' + batch, 31.5, svg.FONT_PT),
-                        ('Кол. изд.: ' + str(quantity), 37, svg.FONT_PT))
-        return qr_label(32, 42 if quantity > 1 else 36, self.qr.create(fields), 2.8, captions, master), fields
+        multiple = quantity > 1
+        batch = ''.join(re.findall(r'[0-9]', serial))[:3] if multiple else serial
+        if multiple and len(batch) != 3:
+            raise ValueError('Для 1T нужны три цифры серийного номера')
+        fields = [('25P', code), ('Q', str(quantity if multiple else product['Cargo_place_count'])),
+                  ('1T' if multiple else 'S', batch)]
+        captions = [(code, 26, svg.FONT_SMALL_PT),
+                    (('Пар. №: ' if multiple else 'Сер. №: ') + batch, 31.5, svg.FONT_PT)]
+        if multiple:
+            captions.append(('Кол. изд.: ' + str(quantity), 37, svg.FONT_PT))
+        return qr_label(32, 42 if multiple else 36, self.qr.create(fields), 2.8,
+                        captions, master), fields
 
     #===== Документы: перенос по ширине шрифта =====
     def render_document(self, values, fields, master):
@@ -172,15 +196,18 @@ class LabelRenderer:
         parts = svg.border(105, 108)
         parts.append(f'<path d="{TRANSPORT_GRID}" fill="none" stroke="black" '
                      f'stroke-width="{svg.GRID_STROKE:g}"/>')
-        barcodes = (self.code128.create([('J', data['tkn'])]),
-                    self.code128.create([('68P', data['fnn'])]), self.pdf417.create(fields))
-        for index, (code, bounds) in enumerate(zip(barcodes, TRANSPORT_BARCODES)):
-            quiet = self.pdf417.QUIET if index == 2 else self.code128.QUIET
-            parts.append(svg.embed(code, *bounds, quiet, quiet if index == 2 else 0))
-        values = {**data, 'place': '{}/{}'.format(data['place_number'], data['place_count']),
+        barcodes = ((self.code128.create([('J', data['tkn'])]), TRANSPORT_BARCODES[0], False),
+                    (self.pdf417.create(fields), TRANSPORT_BARCODES[2], True))
+        if data.get('fnn') is not None and str(data['fnn']).strip():
+            barcodes += ((self.code128.create([('68P', data['fnn'])]),
+                          TRANSPORT_BARCODES[1], False),)
+        for code, bounds, pdf in barcodes:
+            quiet = self.pdf417.QUIET if pdf else self.code128.QUIET
+            parts.append(svg.embed(code, *bounds, quiet, quiet if pdf else 0))
+        values = {**data, 'fnn': data.get('fnn') or '',
+                  'place': '{}/{}'.format(data['place_number'], data['place_count']),
                   'gross': number(data['gross']), 'net': number(data['net']),
                   'dimensions': dimensions(data['dimensions'].replace('×', 'x').split('x'))}
         for template, x, y, size, align in TRANSPORT_TEXT:
-            content = svg.text(template.format_map(values), 0, 0, size * svg.PT, align)
-            parts.append(f'<g transform="translate({x:g} {y:g}) scale(0.77 1)">{content}</g>')
+            parts.append(svg.text(template.format_map(values), x, y, size * svg.PT, align))
         return svg.document(105, 108, parts)

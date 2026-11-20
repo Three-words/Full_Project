@@ -7,7 +7,6 @@ import customtkinter as ctk
 class DetailsOBL:
     LABEL_NAMES = {
         'SVG_Uniq_Marker': 'Маркировка УИИ / ФНН',
-        'SVG_UII': 'УИИ', 'SVG_FNN': 'ФНН',
         'SVG_Single_Item_Package': 'Упаковка изделия',
         'SVG_RE': 'Руководство по эксплуатации',
         'SVG_RO': 'Руководство по обслуживанию',

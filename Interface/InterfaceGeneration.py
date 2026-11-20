@@ -18,7 +18,7 @@ class GenerationWindow(AddRecordWindow):
     #===== Создание формы; значения приходят из TemplateController =====
     def __init__(self, parent, record_id, values, on_generate, addresses, recipients):
         super().__init__(parent, f'Product ID {record_id}',
-                         [(title, '', True) for _, title in FIELDS], on_generate)
+                         [(title, '', key != 'fnn') for key, title in FIELDS], on_generate)
         self.geometry(WINDOW_SIZE)
         for key, options in (('address', addresses), ('recipient', recipients)):
             title = dict(FIELDS)[key]

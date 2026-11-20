@@ -1,21 +1,22 @@
 
 """События правой панели: редактирование, коды, примечания и сворачивание."""
 from tkinter import filedialog, messagebox
-from Controllers.SQL import SQL
-from Controllers.PreviewController import SVGPreviewController
-from GenerateQR import SVGController as svg
 from Interface.ColumnNames import display_name
 
 
 class RightPanelController:
-    LOCKED = {'id', 'code_id', 'product_type_id', 'UII', 'TKN'}
+    LOCKED = {'id', 'code_id', 'product_type_id', 'UII', 'TKN', 'cargo_year'}
     DECIMALS = {'Gross_weight', 'Net_weight', 'Width', 'Height', 'Depth'}
 
-    def __init__(self, bd, records, table, details, notes, templates, parent):
-        self.bd, self.records, self.table = bd, records, table
-        self.details, self.notes, self.templates, self.parent = details, notes, templates, parent
-        self.viewer = SVGPreviewController(parent)
+    #===== Инициализация панели и подключение событий =====
+    def __init__(self, details, notes, parent, on_attribute, on_notes,
+                 on_load_labels, on_preview, on_export):
+        self.details, self.notes, self.parent = details, notes, parent
+        self.on_attribute, self.on_notes = on_attribute, on_notes
+        self.on_load_labels, self.on_preview, self.on_export = on_load_labels, on_preview, on_export
         self.record_id, self.labels, self.editing = None, {}, None
+        self.loaded_codes_for = None
+        self.current_record = {}
         details.tabs.configure(command=self.change_tab)
         notes.save_button.configure(command=self.save_notes)
 
@@ -23,18 +24,19 @@ class RightPanelController:
     def show_record(self, table, record_id, record):
         self.finish_edit()
         self.record_id = record_id if table == 'Product' else None
+        self.current_record = record or {}
         title = (record.get('Product_name') or record.get('product_serial_number') or
                  f'Изделие № {record_id}') if record else None
         self.details.set_title(str(title) if title is not None else None)
         attributes = {display_name(k): v for k, v in record.items()
-                      if k != 'Notes' and not k.startswith('SVG_')} if record else None
+                      if k not in ('Notes', 'cargo_year') and not k.startswith('SVG_') and not k.endswith('_id')} if record else None
         self.details.set_attributes(attributes)
         self.notes.set_notes(record.get('Notes') if record else None, self.record_id is not None)
         for row, left, right in self.details.attribute_rows:
             row.bind('<Configure>', lambda e, a=left, b=right: self.wrap_labels(e, a, b))
         if self.record_id is not None:
             for column in record:
-                if column in self.LOCKED or column == 'Notes' or column.startswith('SVG_'):
+                if column in self.LOCKED or column == 'Notes' or column.startswith('SVG_') or column.endswith('_id'):
                     continue
                 name = display_name(column)
                 label = self.details.value_labels.get(name)
@@ -44,6 +46,7 @@ class RightPanelController:
                     label.bind('<Enter>', lambda _, w=label: w.configure(fg='#90BEF5'))
                     label.bind('<Leave>', lambda _, w=label: w.configure(fg='#F2F6FC'))
         self.labels = {}
+        self.loaded_codes_for = None
         self.details.set_codes(None)
         self.refresh_codes()
 
@@ -64,6 +67,7 @@ class RightPanelController:
         entry.bind('<Return>', lambda _: self.finish_edit(True))
         entry.bind('<Escape>', lambda _: self.finish_edit())
 
+    #===== Сохранение или отмена редактирования поля =====
     def finish_edit(self, save=False):
         if self.editing is None:
             return 'break'
@@ -76,84 +80,61 @@ class RightPanelController:
         self.details.hide_editor(label, entry)
         return 'break'
 
-    #===== Сохранение одного параметра =====
+    #===== Сохранение отдельного параметра через обратный вызов =====
     def save_attribute(self, title, text):
-        if self.record_id is None or self.table.table_name != 'Product':
+        if self.record_id is None:
             return False
         try:
-            record = SQL.get_record(self.bd, 'Product', self.record_id)
-            column = next((k for k in record if display_name(k) == title), None) if record else None
+            column = next((c for c in self.current_record if display_name(c) == title), None)
             if column is None or column in self.LOCKED:
                 raise ValueError('Этот параметр нельзя редактировать напрямую')
             value = text.strip() or None
             if value is not None and column in self.DECIMALS:
                 value = value.replace(',', '.')
-            self.records.update_product(self.record_id, {column: value})
-            updated = SQL.get_record(self.bd, 'Product', self.record_id)
-            self.bd.connection.commit()
+            updated = self.on_attribute(self.record_id, column, value)
+            self.sync_record(updated)
+            return True
         except Exception as error:
-            self.bd.connection.rollback()
             messagebox.showerror('Ошибка изменения параметра', str(error), parent=self.parent)
             return False
-        self.sync_record(updated)
-        return True
 
-    #===== Обновление видимых значений без перестроения интерфейса =====
+    #===== Обновление надписей без пересоздания виджетов =====
     def sync_record(self, record):
+        self.current_record = record
         title = record.get('Product_name') or record.get('product_serial_number') or f'Изделие № {self.record_id}'
         self.details.set_title(str(title))
         for key, value in record.items():
             label = self.details.value_labels.get(display_name(key))
             if label and label.winfo_exists():
                 label.configure(text='—' if value is None or value == '' else str(value))
-        if 'id' not in self.table.columns:
-            return
-        id_col = self.table.columns.index('id')
-        values = tuple(record.get(k) for k in self.table.columns)
-        for i, row in enumerate(self.table.raw_rows):
-            if str(row[id_col]) == str(self.record_id):
-                self.table.raw_rows[i] = values
-                break
-        sheet = self.table.view.table
-        if sheet is None:
-            return
-        formatted = self.table.view.prepare_rows([values])[0]
-        for i, row in enumerate(sheet.data):
-            if str(row[id_col]) == str(self.record_id):
-                for j, value in enumerate(formatted):
-                    if row[j] != value:
-                        sheet.set_cell_data(i, j, value, redraw=False)
-                sheet.refresh()
-                break
 
-    #===== Сохранение примечаний =====
+    #===== Сохранение примечаний без перестроения панели =====
     def save_notes(self):
         if self.record_id is None:
             return
         try:
-            SQL.update_record(self.bd, 'Product', self.record_id,
-                              {'Notes': self.notes.get_notes()}, commit=False)
-            record = SQL.get_record(self.bd, 'Product', self.record_id)
-            self.bd.connection.commit()
+            text = self.notes.get_notes()
+            self.on_notes(self.record_id, text)
+            self.current_record['Notes'] = text
         except Exception as error:
-            self.bd.connection.rollback()
             messagebox.showerror('Ошибка сохранения примечаний', str(error), parent=self.parent)
-            return
-        self.sync_record(record)
 
     #===== Сохранённые SVG: вкладка, просмотр и экспорт =====
     def change_tab(self, name):
         self.finish_edit()
         self.details.show_section(name)
-        self.refresh_codes()
+        if name == 'Коды' and self.loaded_codes_for != self.record_id:
+            self.refresh_codes()
 
+    #===== Загрузка сохранённых этикеток на вкладку =====
     def refresh_codes(self):
         if self.details.get_tab() != 'Коды':
             return
         if self.record_id is None:
             return self.details.set_codes(None)
         try:
-            self.labels = self.templates.load_saved_labels(self.record_id)
+            self.labels = self.on_load_labels(self.record_id)
+            self.loaded_codes_for = self.record_id
             self.details.set_codes(self.labels)
             for name, button in self.details.code_buttons.items():
                 button.configure(command=lambda key=name: self.open_svg(key))
@@ -161,19 +142,21 @@ class RightPanelController:
                 row.bind('<Configure>', lambda e, w=label:
                          w.configure(wraplength=max(65, e.width - 110)))
         except ValueError:
+            self.loaded_codes_for = self.record_id
             self.labels = {}
             self.details.set_codes({})
         except Exception as error:
-            self.bd.connection.rollback()
             messagebox.showerror('Ошибка этикеток', str(error), parent=self.parent)
 
+    #===== Открытие отдельного окна просмотра SVG =====
     def open_svg(self, name):
         try:
-            self.viewer.open(self.labels[name], name, self.record_id,
+            self.on_preview(self.labels[name], name, self.record_id,
                              self.details.LABEL_NAMES.get(name, name))
         except Exception as error:
             messagebox.showerror('Просмотр SVG', str(error), parent=self.parent)
 
+    #===== Экспорт этикеток в выбранную папку =====
     def save_labels(self):
         if self.record_id is None:
             return
@@ -181,11 +164,9 @@ class RightPanelController:
         if not folder:
             return
         try:
-            labels = self.templates.load_saved_labels(self.record_id)
-            paths = svg.export(labels, folder, self.record_id)
+            paths = self.on_export(self.record_id, folder)
             messagebox.showinfo('Сохранение', f'Сохранено этикеток: {len(paths)}\nПапка: {folder}')
         except Exception as error:
-            self.bd.connection.rollback()
             messagebox.showerror('Ошибка сохранения', str(error), parent=self.parent)
 
     #===== Сворачивание правой панели =====
@@ -197,6 +178,7 @@ class RightPanelController:
         tab.bind('<Enter>', lambda _: tab.itemconfigure('tab', fill='#3C5878'))
         tab.bind('<Leave>', lambda _: tab.itemconfigure('tab', fill='#30445D'))
 
+    #===== Сворачивание или разворачивание правой панели =====
     def toggle_panel(self):
         if self.is_open:
             self.finish_edit()

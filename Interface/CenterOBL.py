@@ -88,28 +88,48 @@ class CenterOBL:
         self.columns_menu = ColumnsMenu(parent, card)
         self.columns_menu.on_apply = self.display_columns
 
+    #===== Компактная двухстрочная панель поиска и сортировки =====
     def draw(self):
         search = ctk.CTkFrame(self.parent, fg_color='transparent')
         search.grid(row=0, column=0, columnspan=2, sticky='ew', padx=12, pady=(12, 8))
         search.grid_columnconfigure(2, weight=1)
-        ctk.CTkLabel(search, text='Поиск по:', font=('Segoe UI', 12)).grid(
-            row=0, column=0, padx=(0, 6))
-        self.search_column = ctk.CTkOptionMenu(search, values=['Столбец'],
-                                                fg_color='#151F2D', width=110,
-                                                button_color='#285DAC')
-        self.search_column.grid(row=0, column=1, padx=(0, 6))
-        self.search_entry = ctk.CTkEntry(search, height=34, placeholder_text='Введите значение')
-        self.search_entry.grid(row=0, column=2, sticky='ew', padx=(0, 6))
-        for index, (name, title) in enumerate((('find_button', 'Найти'),
-                                                ('reset_button', 'Сброс'),
-                                                ('columns_button', 'Столбцы ▾')), 3):
-            button = ctk.CTkButton(search, text=title, height=34,
-                                   width=112 if index == 5 else 64,
-                                   fg_color='#285DAC' if index == 3 else '#344256')
-            button.grid(row=0, column=index, padx=(0, 6))
+
+        ctk.CTkLabel(search, text='Поиск:', font=('Segoe UI', 12)).grid(
+            row=0, column=0, sticky='w', padx=(0, 8))
+        self.search_column = ctk.CTkLabel(
+            search, text='Все столбцы', font=('Segoe UI', 12), width=115)
+        self.search_column.grid(row=0, column=1, sticky='w', padx=(0, 8))
+        self.search_entry = ctk.CTkEntry(
+            search, height=34, placeholder_text='Введите значение')
+        self.search_entry.grid(row=0, column=2, sticky='ew', padx=(0, 8))
+
+        for column, name, title in ((3, 'find_button', 'Найти'),
+                                    (4, 'reset_button', 'Сброс')):
+            button = ctk.CTkButton(
+                search, text=title, height=34, width=78,
+                fg_color='#285DAC' if column == 3 else '#344256')
+            button.grid(row=0, column=column, padx=(0, 8))
             setattr(self, name, button)
-        self.columns_button.configure(state='disabled',
-                                      command=lambda: self.columns_menu.toggle(self.columns_button))
+
+        self.columns_button = ctk.CTkButton(
+            search, text='Столбцы ▾', height=34, width=112,
+            fg_color='#344256', state='disabled',
+            command=lambda: self.columns_menu.toggle(self.columns_button))
+        self.columns_button.grid(row=0, column=5, sticky='e')
+
+        ctk.CTkLabel(search, text='Сортировка:', font=('Segoe UI', 12)).grid(
+            row=1, column=0, sticky='w', pady=(9, 0), padx=(0, 8))
+        self.sort_order = ctk.CTkOptionMenu(
+            search, values=['По возрастанию', 'По убыванию', 'По алфавиту'],
+            width=165, height=34, fg_color='#151F2D', button_color='#285DAC')
+        self.sort_order.grid(row=1, column=1, columnspan=2,
+                             sticky='w', pady=(9, 0))
+
+        self.assign_cargo_button = ctk.CTkButton(
+            search, text='Присвоить номер груза', height=34, width=210,
+            fg_color='#285DAC', state='disabled')
+        self.assign_cargo_button.grid(row=1, column=4, columnspan=2,
+                                      sticky='e', pady=(9, 0))
 
     @staticmethod
     def prepare_rows(rows):
@@ -128,8 +148,7 @@ class CenterOBL:
         self.columns = list(columns)
         data = self.prepare_rows(rows)
         self.widths = dict(zip(columns, self.column_widths(columns, data)))
-        self.search_column.configure(values=columns or ['Столбец'])
-        self.search_column.set(columns[0] if columns else 'Столбец')
+        self.search_column.configure(text='Все столбцы')
         self.columns_menu.set_columns(columns)
         self.columns_button.configure(state='normal' if columns else 'disabled')
         self.table = Sheet(self.parent, data=data, headers=columns,
